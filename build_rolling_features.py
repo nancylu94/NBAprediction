@@ -24,9 +24,30 @@ OUTPUT_XLSX = DATA_DIR / "features.xlsx"
 # Metrics to roll (must exist in team_boxscores)
 TEAM_METRICS = ["off_rating", "def_rating", "net_rating", "pace", "efg_pct", "ts_pct"]
 
-# Metrics to aggregate from top rotation players
-PLAYER_METRICS = ["pts", "ast", "reb", "plus_minus"]
+# Player metrics: (source column in player_boxscores, output label)
+PLAYER_METRICS = [
+    ("min_sec",  "MIN"),
+    ("fga",      "FGA"),
+    ("fg_pct",   "FG_PCT"),
+    ("fg3a",     "FG3A"),
+    ("fg3_pct",  "FG3_PCT"),
+    ("fta",      "FTA"),
+    ("ft_pct",   "FT_PCT"),
+    ("ast",      "AST"),
+    ("oreb",     "OREB"),
+    ("dreb",     "DREB"),
+    ("stl",      "STL"),
+    ("blk",      "BLK"),
+    ("pf",       "PF"),
+    ("pts",      "PTS"),
+]
 TOP_N_PLAYERS = 10
+
+
+def _prev_season_year(sy: str) -> str:
+    """'2024-25' -> '2023-24'"""
+    start = int(sy.split("-")[0])
+    return f"{start - 1}-{str(start)[-2:]}"
 
 PLAYOFF_TYPES = {
     "Playoffs", "NBA Finals",
@@ -111,64 +132,117 @@ def build_team_features(tb: pd.DataFrame) -> pd.DataFrame:
 # Player-level rolling features (aggregated to team-game)
 # ---------------------------------------------------------------------------
 
-def build_player_features(pb: pd.DataFrame) -> pd.DataFrame:
+def build_player_features(pb: pd.DataFrame, tb: pd.DataFrame) -> pd.DataFrame:
     """
-    For each team-game, compute L5 rolling stats per player (strictly pre-game),
-    rank by rolling minutes, keep top 10, and return in wide format matching
-    the games 2024-2026.csv layout:
-      p1_PLAYER, p1_MIN_l5, p1_PTS_l5, p1_AST_l5, p1_REB_l5, p1_PM_l5, p1_active,
+    For each team-game, compute per-player features and return in wide format:
+      p1_PLAYER, p1_MIN_std, p1_FGM_std, ..., p1_PTS_std,
+                 p1_MIN_prev, p1_FGM_prev, ..., p1_PTS_prev, p1_active,
       p2_PLAYER, ..., p10_active
-    Players are ordered p1 (most minutes) → p10 (least minutes in rotation).
+
+    Features:
+      _std  — season-to-date average (shift+expanding, strictly pre-game)
+      _prev — full previous season average (no leakage: prior season is complete)
+      active — 1 if player appeared in any of the team's last 5 games
+    Players ranked p1→p10 by season-to-date minutes (fallback: prev season minutes).
     """
     pb = pb.sort_values(["player_id", "game_date"]).copy()
+    available = [(s, l) for s, l in PLAYER_METRICS if s in pb.columns]
+    src_cols  = [s for s, _ in available]
 
-    min_col = "min_sec" if "min_sec" in pb.columns else "min"
+    # ------------------------------------------------------------------
+    # 1. Season-to-date averages (strictly pre-game)
+    # ------------------------------------------------------------------
+    for src, label in available:
+        pb[f"std_{label}"] = pb.groupby(["player_id", "season_year"])[src].transform(
+            _shift_expand
+        )
 
-    pb["roll_min_l5"] = pb.groupby("player_id")[min_col].transform(lambda x: _shift_roll(x, 5))
-    pb["roll_pts_l5"] = pb.groupby("player_id")["pts"].transform(lambda x: _shift_roll(x, 5))
-    pb["roll_ast_l5"] = pb.groupby("player_id")["ast"].transform(lambda x: _shift_roll(x, 5))
-    pb["roll_reb_l5"] = pb.groupby("player_id")["reb"].transform(lambda x: _shift_roll(x, 5))
-    pb["roll_pm_l5"]  = pb.groupby("player_id")["plus_minus"].transform(lambda x: _shift_roll(x, 5))
+    # ------------------------------------------------------------------
+    # 2. Previous season full averages
+    #    Previous season is already complete → no leakage risk.
+    # ------------------------------------------------------------------
+    season_avgs = pb.groupby(["player_id", "season_year"])[src_cols].mean().reset_index()
+    prev_rename = {s: f"prev_{l}" for s, l in available}
+    season_avgs = season_avgs.rename(columns=prev_rename)
 
-    # Active: 1 if player has positive rolling minutes (played in recent games)
-    pb["active"] = (pb["roll_min_l5"].fillna(0) > 0).astype(int)
+    pb["prev_season_year"] = pb["season_year"].apply(_prev_season_year)
+    prev_lookup = season_avgs.rename(columns={"season_year": "prev_season_year"})
+    pb = pb.merge(prev_lookup, on=["player_id", "prev_season_year"], how="left")
 
-    # Rank within team-game by rolling minutes descending (NaN → treated as 0)
-    pb["_min_fill"] = pb["roll_min_l5"].fillna(0)
+    # ------------------------------------------------------------------
+    # 3. Active flag — did player appear in any of the team's last 5 games?
+    # ------------------------------------------------------------------
+    # cutoff_date = date of the 5th-most-recent team game before this one.
+    # Use a sequential game number + self-join to avoid rolling on datetime.
+    team_sched = (
+        tb[["team_id", "game_date"]].drop_duplicates()
+        .sort_values(["team_id", "game_date"])
+        .copy()
+    )
+    team_sched["_gnum"] = team_sched.groupby("team_id").cumcount()
+    cutoff_ref = team_sched[["team_id", "_gnum", "game_date"]].rename(
+        columns={"_gnum": "_cutoff_gnum", "game_date": "cutoff_date"}
+    )
+    team_sched["_cutoff_gnum"] = team_sched["_gnum"] - 5
+    team_sched = team_sched.merge(cutoff_ref, on=["team_id", "_cutoff_gnum"], how="left")
+
+    pb["prev_player_game"] = pb.groupby("player_id")["game_date"].transform(lambda x: x.shift(1))
+    pb = pb.merge(team_sched[["team_id", "game_date", "cutoff_date"]],
+                  on=["team_id", "game_date"], how="left")
+    pb["active"] = (
+        pb["prev_player_game"].notna() &
+        pb["cutoff_date"].notna() &
+        (pb["prev_player_game"] >= pb["cutoff_date"])
+    ).astype(int)
+
+    # ------------------------------------------------------------------
+    # 4. Rank players within team-game by season-to-date minutes
+    #    (fall back to prev season minutes when std is NaN = early season)
+    # ------------------------------------------------------------------
+    pb["_rank_key"] = pb["std_MIN"].fillna(pb.get("prev_MIN", pd.Series(0, index=pb.index))).fillna(0)
     pb["_rank"] = (
-        pb.groupby(["team_id", "game_id"])["_min_fill"]
+        pb.groupby(["team_id", "game_id"])["_rank_key"]
         .rank(ascending=False, method="first")
         .astype(int)
     )
 
     rotation = pb[pb["_rank"] <= TOP_N_PLAYERS].copy()
 
-    keep = ["team_id", "game_id", "_rank", "player_name",
-            "roll_min_l5", "roll_pts_l5", "roll_ast_l5", "roll_reb_l5", "roll_pm_l5", "active"]
-    rotation = rotation[keep].set_index(["team_id", "game_id", "_rank"])
+    # ------------------------------------------------------------------
+    # 5. Pivot to wide format
+    # ------------------------------------------------------------------
+    std_cols  = [f"std_{l}"  for _, l in available]
+    prev_cols = [f"prev_{l}" for _, l in available]
+    keep = (["team_id", "game_id", "_rank", "player_name"]
+            + std_cols + prev_cols + ["active"])
+    keep = [c for c in keep if c in rotation.columns]
 
-    # Unstack rank into columns: (stat, rank) pairs
+    rotation = rotation[keep].set_index(["team_id", "game_id", "_rank"])
     wide = rotation.unstack("_rank")
 
-    # Flatten: ("roll_min_l5", 1) -> "p1_MIN_l5"
-    stat_rename = {
-        "player_name": "PLAYER",
-        "roll_min_l5": "MIN_l5",
-        "roll_pts_l5": "PTS_l5",
-        "roll_ast_l5": "AST_l5",
-        "roll_reb_l5": "REB_l5",
-        "roll_pm_l5":  "PM_l5",
-        "active":      "active",
-    }
-    wide.columns = [f"p{rank}_{stat_rename[stat]}" for stat, rank in wide.columns]
+    # Flatten: ("std_MIN", 1) -> "p1_MIN_std", ("prev_MIN", 1) -> "p1_MIN_prev"
+    def _col_name(stat: str, rank: int) -> str:
+        if stat.startswith("std_"):
+            return f"p{rank}_{stat[4:]}_std"
+        if stat.startswith("prev_"):
+            return f"p{rank}_{stat[5:]}_prev"
+        if stat == "player_name":
+            return f"p{rank}_PLAYER"
+        return f"p{rank}_{stat}"   # "active"
 
-    # Reorder so each player's stats are grouped: p1_PLAYER, p1_MIN_l5, ..., p2_PLAYER, ...
-    stat_order = ["PLAYER", "MIN_l5", "PTS_l5", "AST_l5", "REB_l5", "PM_l5", "active"]
-    ordered = [f"p{r}_{s}" for r in range(1, TOP_N_PLAYERS + 1) for s in stat_order
-               if f"p{r}_{s}" in wide.columns]
-    wide = wide[ordered].reset_index()
+    wide.columns = [_col_name(stat, rank) for stat, rank in wide.columns]
 
-    return wide
+    # Order: p1_PLAYER, p1_*_std (×18), p1_*_prev (×18), p1_active, p2_...
+    labels   = [l for _, l in available]
+    ordered  = []
+    for r in range(1, TOP_N_PLAYERS + 1):
+        ordered.append(f"p{r}_PLAYER")
+        ordered += [f"p{r}_{l}_std"  for l in labels]
+        ordered += [f"p{r}_{l}_prev" for l in labels]
+        ordered.append(f"p{r}_active")
+    ordered = [c for c in ordered if c in wide.columns]
+
+    return wide[ordered].reset_index()
 
 
 # ---------------------------------------------------------------------------
@@ -335,14 +409,21 @@ _FIXED_DESCRIPTIONS = {
 }
 
 
-_PLAYER_STAT_DESC = {
-    "PLAYER": "Player name",
-    "MIN_l5":  "Minutes per game, 5-game rolling average (pre-game, no leakage)",
-    "PTS_l5":  "Points per game, 5-game rolling average (pre-game, no leakage)",
-    "AST_l5":  "Assists per game, 5-game rolling average (pre-game, no leakage)",
-    "REB_l5":  "Rebounds per game, 5-game rolling average (pre-game, no leakage)",
-    "PM_l5":   "Plus/minus per game, 5-game rolling average (pre-game, no leakage)",
-    "active":  "1 if player has positive rolling minutes (recent availability proxy), else 0",
+_PLAYER_STAT_LABELS = {
+    "MIN":     "Minutes per game",
+    "FGA":     "Field goal attempts per game",
+    "FG_PCT":  "Field goal percentage",
+    "FG3A":    "3-point attempts per game",
+    "FG3_PCT": "3-point percentage",
+    "FTA":     "Free throw attempts per game",
+    "FT_PCT":  "Free throw percentage",
+    "AST":     "Assists per game",
+    "OREB":    "Offensive rebounds per game",
+    "DREB":    "Defensive rebounds per game",
+    "STL":     "Steals per game",
+    "BLK":     "Blocks per game",
+    "PF":      "Personal fouls per game",
+    "PTS":     "Points per game",
 }
 
 
@@ -360,14 +441,26 @@ def build_data_dictionary(columns: list[str]) -> pd.DataFrame:
         m = re.match(r"^(home|away)_(p\d+)_(.+)$", col)
         if m:
             side, slot, stat = m.group(1), m.group(2), m.group(3)
-            rank_num   = slot[1:]  # "1", "2", ...
+            rank_num   = slot[1:]
             team_label = "Home" if side == "home" else "Away"
-            stat_desc  = _PLAYER_STAT_DESC.get(stat, stat)
-            rows.append({
-                "column":      col,
-                "category":    f"{team_label} team — individual player features",
-                "description": f"{team_label} team player {rank_num} (ranked by rolling minutes): {stat_desc}.",
-            })
+            category   = f"{team_label} team — individual player features"
+
+            if stat == "PLAYER":
+                desc = f"{team_label} team player {rank_num} name (ranked by season-to-date minutes)."
+            elif stat == "active":
+                desc = f"{team_label} team player {rank_num}: 1 if appeared in any of team's last 5 games, else 0."
+            elif stat.endswith("_std"):
+                base = stat[:-4]
+                base_desc = _PLAYER_STAT_LABELS.get(base, base)
+                desc = f"{team_label} team player {rank_num}: {base_desc}, season-to-date average (pre-game, no leakage)."
+            elif stat.endswith("_prev"):
+                base = stat[:-5]
+                base_desc = _PLAYER_STAT_LABELS.get(base, base)
+                desc = f"{team_label} team player {rank_num}: {base_desc}, full previous season average."
+            else:
+                desc = f"{team_label} team player {rank_num}: {stat}."
+
+            rows.append({"column": col, "category": category, "description": desc})
             continue
 
         # 3. Team rolling / differential columns: {home|away|diff}_{metric}_{window}
@@ -429,7 +522,7 @@ def main():
     team_feats = build_team_features(tb)
 
     print("Building player rolling features...")
-    player_feats = build_player_features(pb)
+    player_feats = build_player_features(pb, tb)
 
     print("Assembling game-level matrix...")
     games = assemble_game_matrix(gi, gs, team_feats, player_feats)
