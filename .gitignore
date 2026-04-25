@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Data files — too large for git (source CSVs up to 730 MB, generated outputs)
+data/
