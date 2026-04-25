@@ -502,8 +502,6 @@ def build_data_dictionary(columns: list[str]) -> pd.DataFrame:
 
         rows.append({"column": col, "category": category, "description": description})
 
-        rows.append({"column": col, "category": category, "description": description})
-
     return pd.DataFrame(rows)
 
 
