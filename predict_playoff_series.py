@@ -1,182 +1,148 @@
+"""
+predict_playoff_series.py
+
+Trains an XGBoost classifier on regular season games, predicts NBA playoff
+game outcomes, then runs a Monte Carlo simulation of each playoff series.
+
+Inputs:
+  data/features.csv              — feature matrix from build_rolling_features.py
+  xgb_random_search_results.json — tuned XGBoost hyperparameters
+
+Outputs:
+  data/game_level_win_probabilities.csv — playoff games with home_win_prob
+  data/series_simulation_results.csv    — series length distribution + competitiveness
+"""
+
 import json
+import re
 from pathlib import Path
-from typing import Iterable
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
-TRAIN_FILE = 'Games__1___1_.csv'
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+FEATURES_FILE = 'data/features.csv'
 RESULTS_FILE = 'xgb_random_search_results.json'
-OUTPUT_FILE = 'game_level_win_probabilities.csv'
-SIMULATION_OUTPUT_FILE = 'series_simulation_results.csv'
+GAME_LEVEL_OUTPUT = 'data/game_level_win_probabilities.csv'
+SERIES_OUTPUT = 'data/series_simulation_results.csv'
 RANDOM_STATE = 42
 SIMULATION_ITERATIONS = 10_000
 HOME_COURT_ORDER = [True, True, False, False, True, False, True]
 
+# Playoff game types used as the test set — excludes play-in games
+PLAYOFF_TEST_TYPES = {
+    "Playoffs", "NBA Finals",
+    "First Round", "East First Round", "West First Round",
+    "Conference Semifinals", "East Second Round", "West Second Round",
+    "Conference Finals", "East Conference Finals", "West Conference Finals",
+}
 
-def raise_if_missing(path: Path) -> None:
+_BASE_DIR = Path(__file__).parent
+
+_METADATA_COLS = frozenset({
+    'game_id', 'game_date', 'season_year', 'season_type', 'matchup',
+    'home', 'away', 'team_id_home', 'team_id_away', 'team_name_home',
+    'team_name_away', 'min',
+})
+_OUTCOME_COLS = frozenset({'winner', 'pts_home', 'pts_away', 'margin'})
+_SERIES_CONTEXT_COLS = frozenset({'game_num_in_series', 'home_series_wins', 'away_series_wins'})
+_PLAYER_NAME_RE = re.compile(r'^(home|away)_p\d+_PLAYER$')
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def load_features() -> pd.DataFrame:
+    path = _BASE_DIR / FEATURES_FILE
     if not path.exists():
-        raise SystemExit(f'Missing required file: {path}')
-
-
-def make_home_win_target(df: pd.DataFrame) -> pd.Series:
-    if 'winner' not in df.columns or 'hometeamId' not in df.columns:
-        raise SystemExit('Source data must contain winner and hometeamId columns.')
-    return (df['winner'] == df['hometeamId']).astype(int)
-
-
-def clean_series_game_number(df: pd.DataFrame) -> pd.DataFrame:
-    if 'seriesGameNumber' not in df.columns:
-        return df
-    df = df.copy()
-    df['seriesGameNumber'] = (
-        df['seriesGameNumber']
-        .astype(str)
-        .str.extract(r'(\d+)')
-        .astype(float)
-        .astype('Int64')
-    )
+        raise FileNotFoundError(
+            f"Features file not found: {path}\n"
+            "Run build_rolling_features.py first."
+        )
+    print(f"Loading features from {path} ...")
+    df = pd.read_csv(path, low_memory=False)
+    print(f"  {len(df):,} rows x {df.shape[1]} columns loaded")
     return df
 
 
-def numeric_feature_matrix(df: pd.DataFrame, drop_columns: Iterable[str]) -> pd.DataFrame:
-    features = df.drop(columns=[col for col in drop_columns if col in df.columns])
-    features = features.select_dtypes(include=['number']).copy()
-    if features.isna().any().any():
-        raise SystemExit('Feature matrix contains missing values; clean data before training.')
-    return features
+# ---------------------------------------------------------------------------
+# Train/test split
+# ---------------------------------------------------------------------------
+
+def split_train_test(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if 'season_type' not in df.columns:
+        raise ValueError(
+            "Column 'season_type' missing — was features.csv produced by build_rolling_features.py?"
+        )
+    train = df[df['season_type'] == 'Regular Season'].copy()
+    test = df[df['season_type'].isin(PLAYOFF_TEST_TYPES)].copy()
+    if train.empty:
+        raise ValueError("No regular season rows found in features.csv.")
+    if test.empty:
+        raise ValueError(
+            "No playoff test rows found. "
+            f"Check that PLAYOFF_TEST_TYPES matches season_type values in features.csv."
+        )
+    print(f"  Train (regular season): {len(train):,} rows")
+    print(f"  Test  (playoff games):  {len(test):,} rows")
+    return train, test
 
 
-def load_training_data() -> tuple[pd.DataFrame, pd.Series, list[str]]:
-    train_path = Path(TRAIN_FILE)
-    raise_if_missing(train_path)
+# ---------------------------------------------------------------------------
+# Feature matrix construction
+# ---------------------------------------------------------------------------
 
-    df = pd.read_csv(train_path, low_memory=False)
-    if 'gameType' not in df.columns:
-        raise SystemExit('Training file must contain gameType column.')
+def build_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Drop metadata, outcome, target, series context, and player-name string columns.
+    Restrict to numeric columns. Fill NaN with 0 (with warning) if any remain.
+    Returns (X, y) where y is the home_win target.
+    """
+    if 'home_win' not in df.columns:
+        raise ValueError("Column 'home_win' not found — cannot build feature matrix.")
 
-    df = df.loc[df['gameType'] == 'Regular Season'].copy()
-    if df.empty:
-        raise SystemExit('No regular season games found in training data.')
+    player_name_cols = {c for c in df.columns if _PLAYER_NAME_RE.match(c)}
+    drop_cols = _METADATA_COLS | _OUTCOME_COLS | {'home_win'} | _SERIES_CONTEXT_COLS | player_name_cols
 
-    y = make_home_win_target(df)
-    feature_exclusions = [
-        'gameId', 'gameDateTimeEst', 'gameType', 'winner',
-        'homeScore', 'awayScore', 'attendance', 'home_win',
-        'gameLabel', 'seriesGameNumber', 'gameStatus', 'gameStatusText',
-    ]
-    X = numeric_feature_matrix(df, feature_exclusions)
-    feature_columns = list(X.columns)
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+    X = X.select_dtypes(include=['number']).copy()
 
-    return X, y, feature_columns
+    nan_counts = X.isna().sum()
+    nan_cols = nan_counts[nan_counts > 0]
+    if not nan_cols.empty:
+        print(
+            f"  WARNING: {nan_cols.sum():,} NaN values in {len(nan_cols)} columns — filling with 0:"
+        )
+        for col, cnt in nan_cols.items():
+            print(f"    {col}: {cnt:,} NaNs")
+        X = X.fillna(0)
+
+    y = df['home_win']
+    return X, y
 
 
-def load_best_params() -> dict:
-    results_path = Path(RESULTS_FILE)
-    raise_if_missing(results_path)
+# ---------------------------------------------------------------------------
+# Model training
+# ---------------------------------------------------------------------------
 
+def train_model(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
+    results_path = _BASE_DIR / RESULTS_FILE
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"Hyperparameter results not found: {results_path}\n"
+            "Run xgb_randomized_search.py first."
+        )
     payload = json.loads(results_path.read_text(encoding='utf-8'))
-    best_params = payload.get('best_params')
-    if not isinstance(best_params, dict):
-        raise SystemExit('best_params not found in JSON results file.')
-    return best_params
-
-
-def prepare_prediction_frame(feature_columns: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    predict_path = Path(TRAIN_FILE)
-    raise_if_missing(predict_path)
-
-    df = pd.read_csv(predict_path, low_memory=False)
-    df = df.loc[df['gameType'] == 'Playoffs'].copy()
-    if df.empty:
-        raise SystemExit('No playoff games found for prediction.')
-
-    df = clean_series_game_number(df)
-    feature_exclusions = [
-        'gameId', 'gameDateTimeEst', 'gameType', 'winner',
-        'homeScore', 'awayScore', 'attendance', 'gameLabel',
-        'seriesGameNumber', 'gameStatus', 'gameStatusText',
-    ]
-    features = numeric_feature_matrix(df, feature_exclusions)
-
-    missing = [col for col in feature_columns if col not in features.columns]
-    extra = [col for col in features.columns if col not in feature_columns]
-    for column in missing:
-        features[column] = 0
-    if extra:
-        features = features.drop(columns=extra)
-    features = features[feature_columns]
-
-    return df, features
-
-
-def simulate_series(predictions: pd.DataFrame) -> pd.DataFrame:
-    np.random.seed(RANDOM_STATE)
-
-    if 'seriesGameNumber' in predictions.columns:
-        predictions = predictions.sort_values(['seriesGameNumber', 'gameDateTimeEst'])
-
-    if 'seriesId' in predictions.columns:
-        group_keys = ['seriesId']
-    elif 'gameLabel' in predictions.columns:
-        group_keys = ['gameLabel', 'hometeamId', 'awayteamId']
-    else:
-        group_keys = ['hometeamId', 'awayteamId']
-
-    rows = []
-    for series_id, group in predictions.groupby(group_keys, dropna=False):
-        ordered = group.sort_values(by=['seriesGameNumber', 'gameDateTimeEst'] if 'seriesGameNumber' in group.columns else ['gameDateTimeEst'])
-        played_probs = ordered['home_win_prob'].tolist()[:7]
-        if len(played_probs) == 0:
-            continue
-
-        # Build exactly 7 probabilities: played games use model output; unplayed
-        # games use the series average home_win_prob, flipped when the higher seed
-        # is away for that slot (HOME_COURT_ORDER[g] = False).
-        avg_prob = float(np.mean(played_probs))
-        full_probs = list(played_probs)
-        for g in range(len(played_probs), 7):
-            full_probs.append(avg_prob if HOME_COURT_ORDER[g] else 1.0 - avg_prob)
-
-        length_counts = {length: 0 for length in range(4, 8)}
-        winner_counts = {'home': 0, 'away': 0}
-        for _ in range(SIMULATION_ITERATIONS):
-            home_wins = 0
-            away_wins = 0
-            games_played = 0
-            for prob in full_probs:
-                games_played += 1
-                if np.random.rand() < prob:
-                    home_wins += 1
-                else:
-                    away_wins += 1
-                if home_wins == 4 or away_wins == 4:
-                    break
-            winner = 'home' if home_wins == 4 else 'away'
-            winner_counts[winner] += 1
-            length_counts[games_played] += 1
-
-        total = SIMULATION_ITERATIONS
-        rows.append({
-            'series_key': '|'.join(map(str, series_id)) if isinstance(series_id, tuple) else str(series_id),
-            'games_4': length_counts[4] / total,
-            'games_5': length_counts[5] / total,
-            'games_6': length_counts[6] / total,
-            'games_7': length_counts[7] / total,
-            'competitiveness_6_or_7': (length_counts[6] + length_counts[7]) / total,
-            'home_win_rate': winner_counts['home'] / total,
-            'away_win_rate': winner_counts['away'] / total,
-            'predicted_games': len(played_probs),
-        })
-
-    return pd.DataFrame(rows)
-
-
-def main() -> None:
-    X_train, y_train, feature_columns = load_training_data()
-    best_params = load_best_params()
-    original_df, predict_features = prepare_prediction_frame(feature_columns)
+    best_params: dict = payload.get('best_params', {})
+    if not best_params:
+        raise ValueError("'best_params' missing or empty in results JSON.")
+    print(f"  Hyperparameters: {best_params}")
 
     model = XGBClassifier(
         objective='binary:logistic',
@@ -187,24 +153,180 @@ def main() -> None:
         **best_params,
     )
     model.fit(X_train, y_train)
+    print(f"  Trained on {len(X_train):,} rows x {X_train.shape[1]} features")
+    return model
 
-    predictions = model.predict_proba(predict_features)[:, 1]
-    output_df = original_df.copy()
-    output_df['home_win_prob'] = predictions
 
-    output_path = Path(OUTPUT_FILE)
-    output_df.to_csv(output_path, index=False, encoding='utf-8')
+# ---------------------------------------------------------------------------
+# Game-level predictions
+# ---------------------------------------------------------------------------
 
-    simulation_results = simulate_series(output_df)
-    simulation_results.to_csv(Path(SIMULATION_OUTPUT_FILE), index=False, encoding='utf-8')
+def predict_playoff_games(
+    model: XGBClassifier,
+    test_df: pd.DataFrame,
+    X_test: pd.DataFrame,
+) -> pd.DataFrame:
+    probs = model.predict_proba(X_test)[:, 1]
+    result = test_df.copy()
+    result['home_win_prob'] = probs
 
-    print(json.dumps({
-        'training_rows': int(len(X_train)),
-        'playoff_rows': int(len(output_df)),
-        'feature_columns': int(len(feature_columns)),
-        'game_level_output': str(output_path),
-        'simulation_output': str(Path(SIMULATION_OUTPUT_FILE)),
-    }, indent=2))
+    out_path = _BASE_DIR / GAME_LEVEL_OUTPUT
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result.to_csv(out_path, index=False)
+    print(f"  Saved {len(result):,} game-level predictions -> {out_path}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo series simulation
+# ---------------------------------------------------------------------------
+
+def simulate_series(predictions: pd.DataFrame) -> pd.DataFrame:
+    """
+    Groups playoff games into series, builds a 7-probability vector for each,
+    and runs SIMULATION_ITERATIONS Monte Carlo draws to estimate series length
+    distribution and competitiveness score.
+
+    full_probs[g] = P(game g's home team wins). HOME_COURT_ORDER determines
+    whether the game-1 home team is home (True) or away (False) for slot g,
+    so wins for the game-1 home team are tracked accordingly.
+    """
+    np.random.seed(RANDOM_STATE)
+
+    required = {'season_year', 'home', 'away', 'game_num_in_series',
+                'game_date', 'home_win_prob', 'home_win'}
+    missing_cols = required - set(predictions.columns)
+    if missing_cols:
+        raise ValueError(f"simulate_series: missing required columns: {missing_cols}")
+
+    # Build series key exactly as add_series_context() does in build_rolling_features.py
+    preds = predictions.copy()
+    preds['_series_key'] = preds.apply(
+        lambda r: (
+            f"{r['season_year']}"
+            f"_{min(r['home'], r['away'])}"
+            f"_{max(r['home'], r['away'])}"
+        ),
+        axis=1,
+    )
+
+    rows = []
+    for series_key, group in preds.groupby('_series_key', sort=False):
+        group = group.sort_values(['game_num_in_series', 'game_date'])
+        played_probs = group['home_win_prob'].tolist()
+        n_played = len(played_probs)
+
+        avg_prob = float(np.mean(played_probs))
+
+        # Fill unplayed game slots (series ended early) using HOME_COURT_ORDER
+        full_probs: list[float] = list(played_probs)
+        for g in range(n_played, 7):
+            full_probs.append(avg_prob if HOME_COURT_ORDER[g] else 1.0 - avg_prob)
+
+        # Simulate: track game-1-home-team wins via HOME_COURT_ORDER orientation
+        length_counts: dict[int, int] = {4: 0, 5: 0, 6: 0, 7: 0}
+        home_team_win_count = 0
+
+        for _ in range(SIMULATION_ITERATIONS):
+            g1h = 0  # game-1 home team cumulative wins
+            g1a = 0  # game-1 away team cumulative wins
+            n_games = 0
+            for g, prob in enumerate(full_probs):
+                n_games += 1
+                r = np.random.rand()
+                if HOME_COURT_ORDER[g]:
+                    # game-1 home team is home this slot
+                    if r < prob:
+                        g1h += 1
+                    else:
+                        g1a += 1
+                else:
+                    # game-1 away team is home this slot
+                    if r < prob:
+                        g1a += 1
+                    else:
+                        g1h += 1
+                if g1h == 4 or g1a == 4:
+                    break
+            if g1h == 4:
+                home_team_win_count += 1
+            length_counts[n_games] += 1
+
+        total = SIMULATION_ITERATIONS
+        season_year = group['season_year'].iloc[0]
+        team_a = min(group['home'].iloc[0], group['away'].iloc[0])
+        team_b = max(group['home'].iloc[0], group['away'].iloc[0])
+
+        # Actual winner: count wins per team across played games
+        team_wins: dict[str, int] = {}
+        for _, row in group.iterrows():
+            winning_team = row['home'] if row['home_win'] == 1 else row['away']
+            team_wins[winning_team] = team_wins.get(winning_team, 0) + 1
+
+        actual_winner: Optional[str] = None
+        if team_wins:
+            max_wins = max(team_wins.values())
+            leaders = [t for t, w in team_wins.items() if w == max_wins]
+            actual_winner = leaders[0] if len(leaders) == 1 else None
+
+        rows.append({
+            'series_key': series_key,
+            'season_year': season_year,
+            'team_a': team_a,
+            'team_b': team_b,
+            'games_4': length_counts[4] / total,
+            'games_5': length_counts[5] / total,
+            'games_6': length_counts[6] / total,
+            'games_7': length_counts[7] / total,
+            'competitiveness_6_or_7': (length_counts[6] + length_counts[7]) / total,
+            'home_team_win_rate': home_team_win_count / total,
+            'predicted_games': n_played,
+            'actual_games': n_played,
+            'actual_winner': actual_winner,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    print("Step 1: Loading features...")
+    df = load_features()
+
+    print("Step 2: Splitting train/test...")
+    train_df, test_df = split_train_test(df)
+
+    print("Step 3: Building feature matrices...")
+    X_train, y_train = build_feature_matrix(train_df)
+    X_test, _ = build_feature_matrix(test_df)
+    print(f"  {X_train.shape[1]} feature columns passed to model")
+
+    print("Step 4: Training XGBoost model...")
+    model = train_model(X_train, y_train)
+
+    print("Step 5: Predicting playoff game outcomes...")
+    predictions = predict_playoff_games(model, test_df, X_test)
+
+    print("Step 6: Running Monte Carlo series simulation...")
+    series_results = simulate_series(predictions)
+    series_path = _BASE_DIR / SERIES_OUTPUT
+    series_path.parent.mkdir(parents=True, exist_ok=True)
+    series_results.to_csv(series_path, index=False)
+    print(f"  Saved {len(series_results):,} series -> {series_path}")
+
+    summary = {
+        'train_rows': int(len(X_train)),
+        'test_rows': int(len(X_test)),
+        'feature_columns': int(X_train.shape[1]),
+        'series_simulated': int(len(series_results)),
+        'game_level_output': GAME_LEVEL_OUTPUT,
+        'series_output': SERIES_OUTPUT,
+    }
+    print("\nJSON Summary:")
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == '__main__':
