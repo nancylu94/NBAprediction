@@ -127,8 +127,14 @@ def main():
 
     pred_dict = pd.DataFrame(PREDICTION_OUTPUT_DICT)
 
+    # Round floats to 6 dp before writing — openpyxl writes full Python float
+    # precision (17 digits) which inflates sheet XML to 270+ MB and breaks Excel.
+    # xlsxwriter produces a clean, compact file.
+    float_cols = games.select_dtypes(include=float).columns
+    games[float_cols] = games[float_cols].round(6)
+
     print(f"Writing {OUTPUT_XLSX} ...")
-    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="xlsxwriter") as writer:
         games.to_excel(writer, sheet_name="features", index=False)
         data_dict.to_excel(writer, sheet_name="data_dictionary", index=False)
         pred_dict.to_excel(writer, sheet_name="prediction_outputs", index=False)

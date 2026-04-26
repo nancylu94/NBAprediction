@@ -112,6 +112,8 @@ def prepare_prediction_frame(feature_columns: list[str]) -> tuple[pd.DataFrame, 
 
 
 def simulate_series(predictions: pd.DataFrame) -> pd.DataFrame:
+    np.random.seed(RANDOM_STATE)
+
     if 'seriesGameNumber' in predictions.columns:
         predictions = predictions.sort_values(['seriesGameNumber', 'gameDateTimeEst'])
 
@@ -125,9 +127,17 @@ def simulate_series(predictions: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for series_id, group in predictions.groupby(group_keys, dropna=False):
         ordered = group.sort_values(by=['seriesGameNumber', 'gameDateTimeEst'] if 'seriesGameNumber' in group.columns else ['gameDateTimeEst'])
-        home_probs = ordered['home_win_prob'].tolist()[:7]
-        if len(home_probs) == 0:
+        played_probs = ordered['home_win_prob'].tolist()[:7]
+        if len(played_probs) == 0:
             continue
+
+        # Build exactly 7 probabilities: played games use model output; unplayed
+        # games use the series average home_win_prob, flipped when the higher seed
+        # is away for that slot (HOME_COURT_ORDER[g] = False).
+        avg_prob = float(np.mean(played_probs))
+        full_probs = list(played_probs)
+        for g in range(len(played_probs), 7):
+            full_probs.append(avg_prob if HOME_COURT_ORDER[g] else 1.0 - avg_prob)
 
         length_counts = {length: 0 for length in range(4, 8)}
         winner_counts = {'home': 0, 'away': 0}
@@ -135,7 +145,7 @@ def simulate_series(predictions: pd.DataFrame) -> pd.DataFrame:
             home_wins = 0
             away_wins = 0
             games_played = 0
-            for prob in home_probs:
+            for prob in full_probs:
                 games_played += 1
                 if np.random.rand() < prob:
                     home_wins += 1
@@ -157,7 +167,7 @@ def simulate_series(predictions: pd.DataFrame) -> pd.DataFrame:
             'competitiveness_6_or_7': (length_counts[6] + length_counts[7]) / total,
             'home_win_rate': winner_counts['home'] / total,
             'away_win_rate': winner_counts['away'] / total,
-            'predicted_games': len(home_probs),
+            'predicted_games': len(played_probs),
         })
 
     return pd.DataFrame(rows)
